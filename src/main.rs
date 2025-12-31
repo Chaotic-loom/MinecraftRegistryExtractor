@@ -1,5 +1,6 @@
-use anyhow::{Context, Result, bail};
-use std::collections::BTreeMap;
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,160 +9,195 @@ use walkdir::WalkDir;
 
 // --- Configuration ---
 const SERVER_JAR: &str = "./server.jar";
-const WORK_DIR: &str = "./temp_data"; // Where we run the java command
-const OUTPUT_DIR: &str = "./registries"; // Where we save the ready-to-send packets
+const WORK_DIR: &str = "./temp_data";
+const OUTPUT_DIR: &str = "./registries";
+
+#[derive(Deserialize)]
+struct TagFile {
+    values: Vec<String>,
+}
 
 fn main() -> Result<()> {
-    println!("--- Minecraft Registry Builder ---");
+    println!("--- Minecraft Registry & Tag Builder ---");
 
-    // 1. Verify Environment
+    // 1. Generate Data using Java
     if !Path::new(SERVER_JAR).exists() {
-        bail!("Could not find '{}'. Please place your 1.21.x server jar in the root directory.", SERVER_JAR);
+        bail!("{} not found!", SERVER_JAR);
     }
-
-    // Check for Java
-    let java_check = Command::new("java").arg("-version").output();
-    if java_check.is_err() {
-        bail!("Java is not installed or not in your PATH.");
-    }
-
-    // 2. Run Data Generator (Replaces extract.sh)
-    println!("Step 1: Generating data from server.jar...");
     generate_data()?;
 
-    // 3. Process and Compile
-    println!("Step 2: compiling registry packets...");
-    // The data generator outputs to <WORK_DIR>/generated/data/minecraft
-    let input_path = Path::new(WORK_DIR).join("generated/data/minecraft");
-
-    if !input_path.exists() {
-        bail!("Data generation failed. Could not find {:?}", input_path);
+    let data_path = Path::new(WORK_DIR).join("generated/data/minecraft");
+    if !data_path.exists() {
+        bail!("Data generation failed.");
     }
 
-    compile_registries(&input_path, Path::new(OUTPUT_DIR))?;
+    // 2. Prepare Output
+    if Path::new(OUTPUT_DIR).exists() {
+        fs::remove_dir_all(OUTPUT_DIR)?;
+    }
+    fs::create_dir_all(OUTPUT_DIR)?;
 
-    println!("--- Success! ---");
-    println!("Registry packets are ready in '{}'", OUTPUT_DIR);
+    // 3. Process Registries
+    // We need to keep a mapping of "Entry Name" -> "Integer ID" for the Tags step
+    // Map<RegistryID, Map<EntryID, ProtocolID>>
+    let mut registry_mappings: HashMap<String, HashMap<String, i32>> = HashMap::new();
 
+    println!("Processing Registries...");
+    compile_registries(&data_path, &mut registry_mappings)?;
+
+    // 4. Process Tags
+    println!("Processing Tags...");
+    compile_tags(&data_path.join("tags"), &registry_mappings)?;
+
+    println!("--- Success! Output in {} ---", OUTPUT_DIR);
     Ok(())
 }
 
 fn generate_data() -> Result<()> {
-    // Clean/Create working directory
-    if Path::new(WORK_DIR).exists() {
-        fs::remove_dir_all(WORK_DIR).context("Failed to clean temp directory")?;
-    }
-    fs::create_dir_all(WORK_DIR).context("Failed to create temp directory")?;
+    if Path::new(WORK_DIR).exists() { fs::remove_dir_all(WORK_DIR)?; }
+    fs::create_dir_all(WORK_DIR)?;
 
-    // We need the absolute path to the jar because we are changing the current dir
-    let jar_abs_path = fs::canonicalize(SERVER_JAR).context("Failed to get absolute path of server.jar")?;
+    let jar_abs = fs::canonicalize(SERVER_JAR)?;
 
-    println!("   Running Java data generator... (this may take a moment)");
-
-    // Command: java -DbundlerMainClass="net.minecraft.data.Main" -jar server.jar --all
+    println!("Running Java data generator...");
     let status = Command::new("java")
-        .current_dir(WORK_DIR) // Run INSIDE temp_data so 'generated' folder appears there
+        .current_dir(WORK_DIR)
         .arg("-DbundlerMainClass=net.minecraft.data.Main")
-        .arg("-jar")
-        .arg(jar_abs_path)
-        .arg("--all")
-        .status()
-        .context("Failed to execute Java command")?;
+        .arg("-jar").arg(jar_abs).arg("--all")
+        .output()?;
 
-    if !status.success() {
-        bail!("Java process exited with error code: {:?}", status.code());
+    if !status.status.success() {
+        bail!("Java failed: {}", String::from_utf8_lossy(&status.stderr));
     }
-
     Ok(())
 }
 
-fn compile_registries(input_path: &Path, output_path: &Path) -> Result<()> {
-    // Map<RegistryName, List<EntryName>>
-    let mut registries: BTreeMap<String, Vec<String>> = BTreeMap::new();
+fn compile_registries(base_path: &Path, mappings: &mut HashMap<String, HashMap<String, i32>>) -> Result<()> {
+    // 1. Find all registries and their entries
+    let mut registries: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
-    // Scan for JSON files
-    for entry in WalkDir::new(input_path).min_depth(1).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(base_path).min_depth(1).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
+        if path.extension().map_or(false, |e| e == "json") {
+            // Check if this file is inside a "tags" folder, if so, skip it (handled later)
+            if path.components().any(|c| c.as_os_str() == "tags") {
+                continue;
+            }
 
-        if path.extension().and_then(|s| s.to_str()) == Some("json") {
-            // Path structure is: .../data/minecraft/<registry_name>/<entry_name>.json
-            // We want to grab <registry_name> and <entry_name>
-
-            // We need to be careful with paths.
-            // The `generated/data/minecraft` folder contains folders like `damage_type`, `worldgen`, etc.
-            // Some registries are nested, like `worldgen/biome`.
-
-            let relative_path = path.strip_prefix(input_path)?;
-
-            if let Some(parent) = relative_path.parent() {
-                // If the file is 'damage_type/fall.json', parent is 'damage_type'
-                // If the file is 'worldgen/biome/plains.json', parent is 'worldgen/biome'
-
-                // Convert path separator to standard registry format (slashes)
-                let registry_suffix = parent.to_string_lossy().replace("\\", "/");
+            let relative = path.strip_prefix(base_path)?;
+            if let Some(parent) = relative.parent() {
+                let registry_name = parent.to_string_lossy().replace("\\", "/");
                 let entry_name = path.file_stem().unwrap().to_string_lossy().to_string();
 
-                let full_registry_id = format!("minecraft:{}", registry_suffix);
-                let full_entry_id = format!("minecraft:{}", entry_name);
+                let full_reg = format!("minecraft:{}", registry_name);
+                let full_entry = format!("minecraft:{}", entry_name);
 
-                registries
-                    .entry(full_registry_id)
-                    .or_default()
-                    .push(full_entry_id);
+                registries.entry(full_reg).or_default().insert(full_entry);
             }
         }
     }
 
-    // Prepare Output
-    if output_path.exists() {
-        fs::remove_dir_all(output_path)?;
-    }
-    fs::create_dir_all(output_path)?;
-
-    // Serialize
-    for (reg_id, mut entries) in registries {
-        // Sort for deterministic output
-        entries.sort();
-
+    // 2. Write Registry Packets (0x07)
+    for (reg_id, entries) in registries {
         let mut buffer: Vec<u8> = Vec::new();
 
-        // 1. Registry Identifier
+        // Header
         write_string(&mut buffer, &reg_id)?;
-
-        // 2. Entry Count
         write_varint(&mut buffer, entries.len() as i32)?;
 
-        // 3. Entries
-        for entry_id in entries {
+        // Entries
+        let mut id_map = HashMap::new();
+        for (idx, entry_id) in entries.iter().enumerate() {
+            // Write to packet
             write_string(&mut buffer, &entry_id)?;
-            // Has Data? -> False (0x00)
-            buffer.push(0x00);
+            buffer.push(0x00); // Has Data? -> False
+
+            // Store ID for mapping (Tags need this ID)
+            id_map.insert(entry_id.clone(), idx as i32);
         }
 
-        // Filename safe: minecraft:worldgen/biome -> minecraft_worldgen_biome.bin
-        let safe_name = reg_id.replace(":", "_").replace("/", "_");
-        let filename = format!("{}.bin", safe_name);
+        mappings.insert(reg_id.clone(), id_map);
 
-        let mut file = File::create(output_path.join(filename))?;
-        file.write_all(&buffer)?;
+        // Save file
+        let filename = format!("{}.bin", reg_id.replace(":", "_").replace("/", "_"));
+        fs::write(Path::new(OUTPUT_DIR).join(filename), &buffer)?;
     }
-
     Ok(())
 }
 
-// --- Binary Helpers ---
+fn compile_tags(tags_path: &Path, registry_mappings: &HashMap<String, HashMap<String, i32>>) -> Result<()> {
+    // Map<RegistryID, Map<TagID, Vec<Integers>>>
+    let mut tags_packet_data: BTreeMap<String, BTreeMap<String, Vec<i32>>> = BTreeMap::new();
+
+    for entry in WalkDir::new(tags_path).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().map_or(false, |e| e == "json") {
+            let relative = path.strip_prefix(tags_path)?;
+
+            // Format: <registry>/<tag>.json OR <registry>/<sub_path>/<tag>.json
+            if let Some(parent) = relative.parent() {
+                let registry_suffix = parent.components().next().unwrap().as_os_str().to_string_lossy();
+                let full_reg = format!("minecraft:{}", registry_suffix);
+
+                // If we don't have this registry in our mappings, we can't build tags for it.
+                if !registry_mappings.contains_key(&full_reg) { continue; }
+
+                // Tag name is everything after the registry folder
+                let tag_suffix = relative.strip_prefix(&*registry_suffix)?.with_extension("").to_string_lossy().replace("\\", "/");
+                let full_tag = format!("minecraft:{}", tag_suffix);
+
+                // Parse JSON
+                let content = fs::read_to_string(path)?;
+                let parsed: TagFile = serde_json::from_str(&content).unwrap_or(TagFile { values: vec![] });
+
+                let mut ids = Vec::new();
+                for value in parsed.values {
+                    // Simple resolution: direct reference only.
+                    // (Vanilla tags sometimes use # for nested tags,
+                    // this simple parser skips them to prevent complexity,
+                    // which is usually fine for the "required" registry tags)
+                    if !value.starts_with("#") {
+                        if let Some(id) = registry_mappings.get(&full_reg).and_then(|m| m.get(&value)) {
+                            ids.push(*id);
+                        }
+                    }
+                }
+
+                tags_packet_data.entry(full_reg).or_default().insert(full_tag, ids);
+            }
+        }
+    }
+
+    // Write "packet_tags.bin" (Packet ID 0x0D body)
+    let mut buffer: Vec<u8> = Vec::new();
+
+    // Registry Count
+    write_varint(&mut buffer, tags_packet_data.len() as i32)?;
+
+    for (reg_name, tags) in tags_packet_data {
+        write_string(&mut buffer, &reg_name)?; // Registry Name
+        write_varint(&mut buffer, tags.len() as i32)?; // Tag Count
+
+        for (tag_name, ids) in tags {
+            write_string(&mut buffer, &tag_name)?; // Tag Name
+            write_varint(&mut buffer, ids.len() as i32)?; // ID Count
+            for id in ids {
+                write_varint(&mut buffer, id)?; // ID
+            }
+        }
+    }
+
+    fs::write(Path::new(OUTPUT_DIR).join("packet_tags.bin"), &buffer)?;
+    Ok(())
+}
 
 fn write_varint(buf: &mut Vec<u8>, mut value: i32) -> Result<()> {
     loop {
         let mut temp = (value & 0x7F) as u8;
         value >>= 7;
-        if value != 0 {
-            temp |= 0x80;
-        }
+        if value != 0 { temp |= 0x80; }
         buf.push(temp);
-        if value == 0 {
-            break;
-        }
+        if value == 0 { break; }
     }
     Ok(())
 }
