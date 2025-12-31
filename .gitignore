@@ -1,0 +1,5 @@
+/target
+.idea/
+*.jar
+/registries
+/temp_data
